@@ -269,6 +269,11 @@ class SessionData:
     created_at: int
     expires_at: int
     
+    def __post_init__(self):
+        # Ensure state is SessionState enum
+        if isinstance(self.state, str):
+            self.state = SessionState(self.state)
+    
     @staticmethod
     def create(admin_id: str, state: SessionState = SessionState.IDLE, ttl: int = 600):
         """Create new session"""
@@ -280,7 +285,6 @@ class SessionData:
             created_at=now,
             expires_at=now + ttl
         )
-
 
 # ==================== DATABASE LAYER ====================
 
@@ -674,6 +678,8 @@ class SessionRepository:
         
         doc = self.collection.find_one({"admin_id": str(admin_id)})
         if doc:
+            # Remove MongoDB _id field before creating SessionData
+            doc.pop('_id', None)
             doc['state'] = SessionState(doc['state'])
             return SessionData(**doc)
         return None
@@ -706,7 +712,6 @@ class SessionRepository:
         """Clean up expired sessions"""
         now = int(time.time())
         self.collection.delete_many({"expires_at": {"$lt": now}})
-
 
 class AnalyticsRepository:
     """Repository for analytics (optional)"""
