@@ -1,35 +1,34 @@
-# render.yaml — Render service definition for the Telegram Query-Match Bot
-# Place this file in your repo root. After push, create a new service in Render
-# and connect it to this repo (Render will detect this file).
-#
-# IMPORTANT:
-# - Do NOT commit real secrets to the repo. Use the Render dashboard to set
-#   TELEGRAM_TOKEN, WEBHOOK_URL and MONGODB_URI as environment variables (see below).
-# - You may leave DB_NAME and WEBHOOK_PATH as defaults or override them in Render.
-
+# render.yaml — Render service definition for Telegram Query-Match Bot
 services:
   - type: web
     name: tg-query-match-bot
     env: python
-    plan: free                    # change plan if you need more resources
-    region: ord                   # choose region (example: ord). Change as needed.
-    # Build & start
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --log-file -
-    autoDeploy: true              # deploy on each push
-    # Health check (optional)
-    healthCheckPath: /
-    # Environment variables — DO NOT place real secrets here in the repo.
-    # Set TELEGRAM_TOKEN, WEBHOOK_URL and MONGODB_URI in the Render UI (Environment).
+    plan: free
+    region: oregon  # or: frankfurt, ohio, singapore
+    pythonVersion: "3.11"  # Important: Specify Python version
+    
+    # Build & start commands
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 2 --timeout 120 --log-level info
+    
+    # Auto-deploy on git push
+    autoDeploy: true
+    
+    # Health check
+    healthCheckPath: /health
+    initialDelaySec: 15
+    
+    # Environment variables - Set secrets in Render dashboard
     envVars:
       - key: DB_NAME
         value: tg_bot_db
       - key: WEBHOOK_PATH
         value: /webhook
-
-# Optional: you can declare background workers, cron jobs, or databases here if needed.
-# Example (commented) for a managed PostgreSQL (not used by this app):
-# databases:
-#   - name: my-postgres
-#     engine: pg
-#     plan: starter
+      - key: PORT
+        value: 10000  # Render sets $PORT automatically, but this is backup
+      - key: DEBUG
+        value: "false"
+      - key: USE_REDIS
+        value: "false"  # Disable Redis on Render free tier
