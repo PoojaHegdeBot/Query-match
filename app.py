@@ -12,6 +12,9 @@ Enterprise architecture with:
 - Transaction Safety
 - Background Tasks
 - Analytics
+- Full Edit Capability
+- Auto-Delete System
+- Duplicate Prevention
 """
 
 import os
@@ -24,6 +27,7 @@ from functools import wraps
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
+from dotenv import load_dotenv
 
 from flask import Flask, request, abort, jsonify
 import telebot
@@ -35,6 +39,8 @@ from pymongo import MongoClient, ASCENDING, DESCENDING, errors as mongo_errors
 from bson.objectid import ObjectId
 from redis import Redis, RedisError
 from apscheduler.schedulers.background import BackgroundScheduler
+
+load_dotenv()
 
 # ==================== CONFIGURATION ====================
 
@@ -49,6 +55,11 @@ class Config:
     # Database
     MONGODB_URI = os.getenv("MONGODB_URI")
     DB_NAME = os.getenv("DB_NAME", "tg_bot_db")
+    
+    # Admin
+    ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+    API_HASH = os.getenv("API_HASH")
+    APP_ID = os.getenv("APP_ID")
     
     # Redis (optional - will work without it)
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -73,6 +84,14 @@ class Config:
     PORT = int(os.getenv("PORT", "5000"))
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
     
+    # Auto-delete timers (in seconds)
+    AUTO_DELETE_MATCHED_QUERY = int(os.getenv("AUTO_DELETE_MATCHED_QUERY", "10"))
+    AUTO_DELETE_WELCOME_MSG = int(os.getenv("AUTO_DELETE_WELCOME_MSG", "30"))
+    AUTO_DELETE_RESPONSE = int(os.getenv("AUTO_DELETE_RESPONSE", "10"))
+    
+    # Editing
+    MAX_EDIT_RETRIES = int(os.getenv("MAX_EDIT_RETRIES", "3"))
+
     @classmethod
     def validate(cls):
         """Validate required configuration"""
@@ -143,6 +162,13 @@ class SessionState(Enum):
     SEARCH_MATCH = "search_match"
     PREVIEW_MATCH = "preview_match"
     DELETE_MATCH = "delete_match"
+    EDIT_MATCH = "edit_match"
+    EDIT_SELECT_FIELD = "edit_select_field"
+    EDIT_NAME = "edit_name"
+    EDIT_PATTERN = "edit_pattern"
+    EDIT_CAPTION = "edit_caption"
+    EDIT_IMAGE = "edit_image"
+    EDIT_BUTTONS = "edit_buttons"
 
 
 class AdminRole(Enum):
@@ -399,8 +425,15 @@ class MatchRepository:
         self.cache = cache
     
     def create(self, match: Match) -> ObjectId:
-        """Create new match"""
+        """Create new match with duplicate name check"""
         try:
+            # Check for duplicate name for same admin
+            if self.collection.find_one({
+                "admin_id": match.admin_id,
+                "name": {"$regex": f"^{re.escape(match.name)}$", "$options": "i"}
+            }):
+                raise ValueError(f"Match name '{match.name}' already exists")
+            
             result = self.collection.insert_one(match.to_dict())
             self.cache.clear_pattern(f"matches:*")
             logger.info(f"✅ Match created: {match.name}")
@@ -408,6 +441,60 @@ class MatchRepository:
         except mongo_errors.PyMongoError as e:
             logger.error(f"❌ Failed to create match: {e}")
             raise
+
+    def update(self, match_id: str, admin_id: str, updates: Dict[str, Any]) -> bool:
+        """Update match fields"""
+        try:
+            updates['updated_at'] = int(time.time())
+            result = self.collection.update_one(
+                {"_id": ObjectId(match_id), "admin_id": str(admin_id)},
+                {"$set": updates}
+            )
+            if result.modified_count > 0:
+                self.cache.clear_pattern(f"matches:*")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"❌ Update match error: {e}")
+            return False
+
+    def update_full(self, match_id: str, admin_id: str, updates: Dict[str, Any]) -> bool:
+        """Full match update with validation"""
+        try:
+            # If name is being updated, check for duplicates
+            if 'name' in updates:
+                existing = self.collection.find_one({
+                    "admin_id": admin_id,
+                    "name": {"$regex": f"^{re.escape(updates['name'])}$", "$options": "i"},
+                    "_id": {"$ne": ObjectId(match_id)}
+                })
+                if existing:
+                    raise ValueError(f"Match name '{updates['name']}' already exists")
+            
+            updates['updated_at'] = int(time.time())
+            result = self.collection.update_one(
+                {"_id": ObjectId(match_id), "admin_id": str(admin_id)},
+                {"$set": updates}
+            )
+            if result.modified_count > 0:
+                self.cache.clear_pattern(f"matches:*")
+                return True
+            return False
+        except ValueError as e:
+            raise e  # Re-raise duplicate name error
+        except Exception as e:
+            logger.error(f"❌ Update match error: {e}")
+            return False
+
+    def exists_by_name(self, name: str, admin_id: str) -> bool:
+        """Check if match name exists for specific admin (case-insensitive)"""
+        try:
+            return self.collection.count_documents({
+                "admin_id": admin_id,
+                "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}
+            }) > 0
+        except Exception:
+            return False
     
     def find_by_id(self, match_id: str, admin_id: str) -> Optional[Match]:
         """Find match by ID"""
@@ -420,6 +507,31 @@ class MatchRepository:
         except Exception as e:
             logger.error(f"❌ Find by ID error: {e}")
             return None
+
+    def find_by_name(self, name: str, admin_id: str) -> Optional[Match]:
+        """Find match by name for specific admin"""
+        try:
+            doc = self.collection.find_one({
+                "admin_id": admin_id,
+                "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}
+            })
+            return Match(**doc) if doc else None
+        except Exception as e:
+            logger.error(f"❌ Find by name error: {e}")
+            return None
+
+    def find_by_id_or_name(self, identifier: str, admin_id: str) -> Optional[Match]:
+        """Find match by either ID or Name"""
+        # Try as ObjectId first
+        try:
+            match = self.find_by_id(identifier, admin_id)
+            if match:
+                return match
+        except:
+            pass
+        
+        # Try as name
+        return self.find_by_name(identifier, admin_id)
     
     def find_all_active(self) -> List[Match]:
         """Get all active matches (cached)"""
@@ -748,6 +860,52 @@ class ValidationService:
         return valid_buttons
 
 
+class AutoDeleteService:
+    """Service for auto-deleting messages"""
+    
+    def __init__(self, bot):
+        self.bot = bot
+    
+    def delete_after(self, chat_id: int, message_id: int, delay: int):
+        """Delete message after delay"""
+        def delete_job():
+            try:
+                time.sleep(delay)
+                self.bot.delete_message(chat_id, message_id)
+                logger.debug(f"✅ Auto-deleted message {message_id} in chat {chat_id}")
+            except Exception as e:
+                logger.debug(f"⚠️ Could not auto-delete message: {e}")
+        
+        import threading
+        thread = threading.Thread(target=delete_job)
+        thread.daemon = True
+        thread.start()
+    
+    def delete_query_and_response(self, query_msg_id: int, response_msg_id: int, chat_id: int):
+        """Delete both query and response messages"""
+        def delete_both():
+            try:
+                time.sleep(Config.AUTO_DELETE_MATCHED_QUERY)
+                # Delete response first
+                try:
+                    self.bot.delete_message(chat_id, response_msg_id)
+                except:
+                    pass
+                # Then delete query
+                try:
+                    self.bot.delete_message(chat_id, query_msg_id)
+                except:
+                    pass
+                logger.debug(f"✅ Auto-deleted query {query_msg_id} and response {response_msg_id}")
+            except Exception as e:
+                logger.debug(f"⚠️ Could not auto-delete messages: {e}")
+        
+        import threading
+        thread = threading.Thread(target=delete_both)
+        thread.daemon = True
+        thread.start()
+
+
 # ==================== BOT SETUP ====================
 
 # Initialize components
@@ -770,6 +928,9 @@ validation_service = ValidationService()
 bot = telebot.TeleBot(Config.TELEGRAM_TOKEN, parse_mode="HTML", threaded=False)
 app = Flask(__name__)
 
+# Initialize auto-delete service
+auto_delete_service = AutoDeleteService(bot)
+
 
 # ==================== DECORATORS ====================
 
@@ -777,7 +938,7 @@ def admin_only(func):
     """Decorator for admin-only functions"""
     @wraps(func)
     def wrapper(message, *args, **kwargs):
-        if not admin_repo.is_admin(message.from_user.id):
+        if message.from_user.id not in Config.ADMIN_IDS:
             return
         return func(message, *args, **kwargs)
     return wrapper
@@ -813,10 +974,27 @@ def get_admin_menu() -> ReplyKeyboardMarkup:
         KeyboardButton("➕ Add Match"),
         KeyboardButton("📋 List Matches"),
         KeyboardButton("🔍 Search"),
+        KeyboardButton("✏️ Edit Match"),
         KeyboardButton("🗑️ Delete"),
         KeyboardButton("👁️ Preview"),
         KeyboardButton("📊 Stats"),
         KeyboardButton("❌ Cancel")
+    )
+    return markup
+
+
+def get_edit_menu() -> ReplyKeyboardMarkup:
+    """Get edit options menu"""
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        KeyboardButton("📝 Edit Name"),
+        KeyboardButton("🎯 Edit Pattern"),
+        KeyboardButton("📄 Edit Caption"),
+        KeyboardButton("🖼️ Edit Image"),
+        KeyboardButton("🔘 Edit Buttons"),
+        KeyboardButton("👁️ Preview"),
+        KeyboardButton("✅ Done Editing"),
+        KeyboardButton("❌ Cancel Edit")
     )
     return markup
 
@@ -863,10 +1041,6 @@ def safe_send_photo(chat_id: int, photo: str, caption: str = None,
         return bot.send_message(
             chat_id,
             fallback_text,
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-            reply_to_message_id=reply_to
-        )
             reply_markup=reply_markup,
             parse_mode="HTML",
             reply_to_message_id=reply_to
@@ -934,6 +1108,7 @@ def cmd_stats(message):
                 text += f"{i}. {p.get('name', 'Unknown')} ({p['count']} hits)\n"
     
     bot.send_message(message.chat.id, text, reply_markup=get_admin_menu())
+
 
 # ==================== MENU HANDLERS ====================
 
@@ -1003,7 +1178,7 @@ def menu_preview(message):
     
     bot.send_message(
         message.chat.id,
-        "👁️ <b>Preview Match</b>\n\nSend the Match ID to preview:",
+        "👁️ <b>Preview Match</b>\n\nSend the Match ID or Name to preview:",
         reply_markup=ReplyKeyboardRemove()
     )
 
@@ -1018,8 +1193,23 @@ def menu_delete(message):
     
     bot.send_message(
         message.chat.id,
-        "🗑️ <b>Delete Match</b>\n\n⚠️ Send the Match ID to delete:\n\n"
+        "🗑️ <b>Delete Match</b>\n\n⚠️ Send the Match ID or Name to delete:\n\n"
         "<i>This action cannot be undone!</i>",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+@bot.message_handler(func=lambda m: m.chat.type == "private" and m.text == "✏️ Edit Match")
+@admin_only
+def menu_edit_match(message):
+    """Start edit match flow"""
+    session_repo.delete(message.from_user.id)
+    session = SessionData.create(message.from_user.id, SessionState.EDIT_MATCH)
+    session_repo.save(session)
+    
+    bot.send_message(
+        message.chat.id,
+        "✏️ <b>Edit Match</b>\n\nSend the Match ID or Name to edit:",
         reply_markup=ReplyKeyboardRemove()
     )
 
@@ -1043,7 +1233,7 @@ def menu_cancel(message):
     )
 
 
-# ==================== MATCH CREATION FLOW ====================
+# ==================== TEXT MESSAGE HANDLER ====================
 
 @bot.message_handler(func=lambda m: m.chat.type == "private" and m.text and not m.text.startswith('/'), 
                     content_types=["text"])
@@ -1059,15 +1249,405 @@ def handle_admin_text(message):
     state = session.state
     data = session.data
     
-    # STEP 1: Await Name
-    if state == SessionState.AWAIT_NAME:
+    # EDIT MATCH FLOW - Find match by ID or Name
+    if state == SessionState.EDIT_MATCH:
+        identifier = message.text.strip()
+        match = match_repo.find_by_id_or_name(identifier, str(uid))
+        
+        if match:
+            data['editing_match_id'] = str(match._id)
+            data['editing_match'] = asdict(match)
+            session.state = SessionState.EDIT_SELECT_FIELD
+            session_repo.save(session)
+            
+            bot.send_message(
+                message.chat.id,
+                f"✏️ <b>Editing: {match.name}</b>\n\n"
+                f"🆔 <code>{match._id}</code>\n"
+                f"🎯 Pattern: {match.pattern}\n"
+                f"🖼️ Image: {'Yes' if match.image_ref else 'No'}\n"
+                f"🔘 Buttons: {len(match.buttons)}\n\n"
+                f"Select what you want to edit:",
+                reply_markup=get_edit_menu()
+            )
+        else:
+            bot.send_message(
+                message.chat.id,
+                "❌ Match not found or you don't have permission\n\n"
+                "Please check the Match ID or Name and try again:",
+                reply_markup=get_admin_menu()
+            )
+            session_repo.delete(uid)
+    
+    # EDIT FIELD SELECTION
+    elif state == SessionState.EDIT_SELECT_FIELD:
+        match_id = data.get('editing_match_id')
+        match_data = data.get('editing_match', {})
+        
+        if message.text == "📝 Edit Name":
+            session.state = SessionState.EDIT_NAME
+            session_repo.save(session)
+            current_name = match_data.get('name', '')
+            bot.send_message(
+                message.chat.id,
+                f"📝 <b>Edit Name</b>\n\nCurrent name: <b>{current_name}</b>\n\nSend new name:",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        
+        elif message.text == "🎯 Edit Pattern":
+            session.state = SessionState.EDIT_PATTERN
+            session_repo.save(session)
+            current_pattern = match_data.get('pattern', '')
+            bot.send_message(
+                message.chat.id,
+                f"🎯 <b>Edit Pattern</b>\n\nCurrent pattern: <code>{current_pattern}</code>\n\nSend new pattern (regex supported):",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        
+        elif message.text == "📄 Edit Caption":
+            session.state = SessionState.EDIT_CAPTION
+            session_repo.save(session)
+            current_caption = match_data.get('caption', '')
+            bot.send_message(
+                message.chat.id,
+                f"📄 <b>Edit Caption</b>\n\nCurrent caption:\n<code>{current_caption}</code>\n\nSend new caption:",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        
+        elif message.text == "🖼️ Edit Image":
+            session.state = SessionState.EDIT_IMAGE
+            session_repo.save(session)
+            current_image = "Exists" if match_data.get('image_ref') else "None"
+            bot.send_message(
+                message.chat.id,
+                f"🖼️ <b>Edit Image</b>\n\nCurrent image: {current_image}\n\n"
+                f"Send new photo or URL:\n"
+                f"• Send a photo to update image\n"
+                f"• Send URL to update image\n"
+                f"• Send 'remove' to remove current image\n"
+                f"• Send 'keep' to keep current image",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        
+        elif message.text == "🔘 Edit Buttons":
+            session.state = SessionState.EDIT_BUTTONS
+            session_repo.save(session)
+            current_buttons = match_data.get('buttons', [])
+            buttons_text = "\n".join([f"{b.get('text', '')}|{b.get('url', '')}" for b in current_buttons]) if current_buttons else "No buttons"
+            bot.send_message(
+                message.chat.id,
+                f"🔘 <b>Edit Buttons</b>\n\nCurrent buttons:\n<code>{buttons_text}</code>\n\n"
+                f"Send new buttons (one per line, format: Text|URL):\n"
+                f"• Send 'remove' to remove all buttons\n"
+                f"• Send 'keep' to keep current buttons",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        
+        elif message.text == "👁️ Preview":
+            # Preview current state
+            match = Match(**match_data)
+            bot.send_message(message.chat.id, "👁️ <b>Current Preview:</b>")
+            
+            if match.image_ref:
+                safe_send_photo(
+                    message.chat.id,
+                    match.image_ref,
+                    caption=match.caption,
+                    reply_markup=build_inline_buttons(match.buttons)
+                )
+            else:
+                bot.send_message(
+                    message.chat.id,
+                    match.caption,
+                    reply_markup=build_inline_buttons(match.buttons)
+                )
+        
+        elif message.text == "✅ Done Editing":
+            # Save all changes and exit
+            session_repo.delete(uid)
+            bot.send_message(
+                message.chat.id,
+                "✅ Editing completed!",
+                reply_markup=get_admin_menu()
+            )
+        
+        elif message.text == "❌ Cancel Edit":
+            session_repo.delete(uid)
+            bot.send_message(
+                message.chat.id,
+                "❌ Edit cancelled",
+                reply_markup=get_admin_menu()
+            )
+    
+    # EDIT NAME
+    elif state == SessionState.EDIT_NAME:
+        match_id = data.get('editing_match_id')
+        new_name = validation_service.sanitize_text(message.text, 200)
+        
+        if not new_name:
+            bot.reply_to(message, "⚠️ Please send a valid name")
+            return
+        
+        try:
+            updates = {'name': new_name}
+            if match_repo.update_full(match_id, str(uid), updates):
+                # Update session data
+                data['editing_match']['name'] = new_name
+                session.state = SessionState.EDIT_SELECT_FIELD
+                session_repo.save(session)
+                
+                bot.send_message(
+                    message.chat.id,
+                    f"✅ Name updated to: <b>{new_name}</b>",
+                    reply_markup=get_edit_menu()
+                )
+            else:
+                bot.send_message(message.chat.id, "❌ Failed to update name", reply_markup=get_edit_menu())
+        except ValueError as e:
+            bot.reply_to(message, f"❌ {e}")
+    
+    # EDIT PATTERN
+    elif state == SessionState.EDIT_PATTERN:
+        match_id = data.get('editing_match_id')
+        new_pattern = validation_service.sanitize_text(message.text, 200)
+        
+        if not new_pattern:
+            bot.reply_to(message, "⚠️ Please send a valid pattern")
+            return
+        
+        updates = {'pattern': new_pattern}
+        if match_repo.update_full(match_id, str(uid), updates):
+            data['editing_match']['pattern'] = new_pattern
+            session.state = SessionState.EDIT_SELECT_FIELD
+            session_repo.save(session)
+            
+            bot.send_message(
+                message.chat.id,
+                f"✅ Pattern updated to: <code>{new_pattern}</code>",
+                reply_markup=get_edit_menu()
+            )
+        else:
+            bot.send_message(message.chat.id, "❌ Failed to update pattern", reply_markup=get_edit_menu())
+    
+    # EDIT CAPTION
+    elif state == SessionState.EDIT_CAPTION:
+        match_id = data.get('editing_match_id')
+        new_caption = validation_service.sanitize_text(message.text, Config.MAX_CAPTION_LENGTH)
+        
+        if not new_caption:
+            bot.reply_to(message, "⚠️ Please send a valid caption")
+            return
+        
+        updates = {'caption': new_caption}
+        if match_repo.update_full(match_id, str(uid), updates):
+            data['editing_match']['caption'] = new_caption
+            session.state = SessionState.EDIT_SELECT_FIELD
+            session_repo.save(session)
+            
+            bot.send_message(
+                message.chat.id,
+                "✅ Caption updated!",
+                reply_markup=get_edit_menu()
+            )
+        else:
+            bot.send_message(message.chat.id, "❌ Failed to update caption", reply_markup=get_edit_menu())
+    
+    # EDIT IMAGE
+    elif state == SessionState.EDIT_IMAGE:
+        match_id = data.get('editing_match_id')
+        text = message.text.strip().lower() if message.text else ""
+        
+        if text == 'remove':
+            updates = {'image_ref': None}
+            if match_repo.update_full(match_id, str(uid), updates):
+                data['editing_match']['image_ref'] = None
+                session.state = SessionState.EDIT_SELECT_FIELD
+                session_repo.save(session)
+                bot.send_message(message.chat.id, "✅ Image removed", reply_markup=get_edit_menu())
+            else:
+                bot.send_message(message.chat.id, "❌ Failed to remove image", reply_markup=get_edit_menu())
+        
+        elif text == 'keep':
+            session.state = SessionState.EDIT_SELECT_FIELD
+            session_repo.save(session)
+            bot.send_message(message.chat.id, "✅ Image unchanged", reply_markup=get_edit_menu())
+        
+        elif validation_service.validate_url(message.text):
+            url = message.text.strip()
+            updates = {'image_ref': url}
+            if match_repo.update_full(match_id, str(uid), updates):
+                data['editing_match']['image_ref'] = url
+                session.state = SessionState.EDIT_SELECT_FIELD
+                session_repo.save(session)
+                
+                # Preview
+                safe_send_photo(message.chat.id, url, caption=data['editing_match'].get('caption', ''))
+                bot.send_message(message.chat.id, "✅ Image updated!", reply_markup=get_edit_menu())
+            else:
+                bot.send_message(message.chat.id, "❌ Failed to update image", reply_markup=get_edit_menu())
+        
+        else:
+            bot.reply_to(message, "⚠️ Send a photo, valid URL, 'remove', or 'keep'")
+    
+    # EDIT BUTTONS
+    elif state == SessionState.EDIT_BUTTONS:
+        match_id = data.get('editing_match_id')
+        text = message.text.strip().lower()
+        
+        if text == 'remove':
+            updates = {'buttons': []}
+            if match_repo.update_full(match_id, str(uid), updates):
+                data['editing_match']['buttons'] = []
+                session.state = SessionState.EDIT_SELECT_FIELD
+                session_repo.save(session)
+                bot.send_message(message.chat.id, "✅ All buttons removed", reply_markup=get_edit_menu())
+            else:
+                bot.send_message(message.chat.id, "❌ Failed to remove buttons", reply_markup=get_edit_menu())
+        
+        elif text == 'keep':
+            session.state = SessionState.EDIT_SELECT_FIELD
+            session_repo.save(session)
+            bot.send_message(message.chat.id, "✅ Buttons unchanged", reply_markup=get_edit_menu())
+        
+        else:
+            # Parse button input
+            lines = message.text.strip().split('\n')
+            buttons = []
+            added = 0
+            
+            for line in lines:
+                if '|' not in line:
+                    continue
+                
+                parts = line.split('|', 1)
+                btn_text = validation_service.sanitize_text(parts[0], 100)
+                url = parts[1].strip()
+                
+                if validation_service.validate_url(url):
+                    buttons.append({"text": btn_text or "Link", "url": url})
+                    added += 1
+                    
+                    if len(buttons) >= Config.MAX_BUTTONS_PER_MATCH:
+                        break
+            
+            updates = {'buttons': buttons}
+            if match_repo.update_full(match_id, str(uid), updates):
+                data['editing_match']['buttons'] = buttons
+                session.state = SessionState.EDIT_SELECT_FIELD
+                session_repo.save(session)
+                
+                bot.send_message(
+                    message.chat.id,
+                    f"✅ Buttons updated! Total: {len(buttons)}",
+                    reply_markup=get_edit_menu()
+                )
+            else:
+                bot.send_message(message.chat.id, "❌ Failed to update buttons", reply_markup=get_edit_menu())
+    
+    # PREVIEW MATCH (enhanced to handle both ID and Name)
+    elif state == SessionState.PREVIEW_MATCH:
+        identifier = message.text.strip()
+        match = match_repo.find_by_id_or_name(identifier, str(uid))
+        
+        if match:
+            bot.send_message(message.chat.id, f"👁️ <b>Preview: {match.name}</b>")
+            
+            if match.image_ref:
+                safe_send_photo(
+                    message.chat.id,
+                    match.image_ref,
+                    caption=match.caption,
+                    reply_markup=build_inline_buttons(match.buttons)
+                )
+            else:
+                bot.send_message(
+                    message.chat.id,
+                    match.caption,
+                    reply_markup=build_inline_buttons(match.buttons)
+                )
+            
+            bot.send_message(
+                message.chat.id,
+                f"📊 Stats: {match.match_count} hits\n"
+                f"🆔 ID: <code>{match._id}</code>",
+                reply_markup=get_admin_menu()
+            )
+        else:
+            bot.send_message(
+                message.chat.id,
+                "❌ Match not found or you don't have permission",
+                reply_markup=get_admin_menu()
+            )
+        
+        session_repo.delete(uid)
+    
+    # DELETE MATCH (enhanced to handle both ID and Name)
+    elif state == SessionState.DELETE_MATCH:
+        identifier = message.text.strip()
+        match = match_repo.find_by_id_or_name(identifier, str(uid))
+        
+        if match:
+            if match_repo.delete(str(match._id), str(uid)):
+                bot.send_message(
+                    message.chat.id,
+                    f"✅ Deleted: <b>{match.name}</b>",
+                    reply_markup=get_admin_menu()
+                )
+                
+                analytics_repo.log_event("match_deleted", {
+                    "admin_id": str(uid),
+                    "match_id": str(match._id),
+                    "name": match.name
+                })
+            else:
+                bot.send_message(
+                    message.chat.id,
+                    "❌ Failed to delete",
+                    reply_markup=get_admin_menu()
+                )
+        else:
+            bot.send_message(
+                message.chat.id,
+                "❌ Match not found",
+                reply_markup=get_admin_menu()
+            )
+        
+        session_repo.delete(uid)
+    
+    # SEARCH MATCH
+    elif state == SessionState.SEARCH_MATCH:
+        query = validation_service.sanitize_text(message.text, 100)
+        results = match_repo.search(str(uid), query, Config.MAX_SEARCH_RESULTS)
+        
+        if results:
+            text = f"🔍 <b>Found {len(results)} result(s)</b>\n\n"
+            for i, match in enumerate(results, 1):
+                icon = "🖼️" if match.image_ref else "📄"
+                text += f"{i}. {icon} <b>{match.name}</b>\n   <code>{match._id}</code>\n\n"
+            bot.send_message(message.chat.id, text, reply_markup=get_admin_menu())
+        else:
+            bot.send_message(
+                message.chat.id,
+                f"❌ No results for: <b>{query}</b>",
+                reply_markup=get_admin_menu()
+            )
+        
+        session_repo.delete(uid)
+    
+    # ORIGINAL CREATE FLOW (with duplicate prevention)
+    elif state == SessionState.AWAIT_NAME:
         name = validation_service.sanitize_text(message.text, 200)
         if not name:
             bot.reply_to(message, "⚠️ Please send a valid name")
             return
         
+        # Check for duplicate name
+        if match_repo.exists_by_name(name, str(uid)):
+            bot.reply_to(message, f"❌ Match name '{name}' already exists. Please use a different name.")
+            return
+        
         data['name'] = name
-        data['pattern'] = name  # Default pattern is the name
+        data['pattern'] = name
         session.state = SessionState.AWAIT_IMAGE
         session_repo.save(session)
         
@@ -1080,9 +1660,8 @@ def handle_admin_text(message):
             f"<i>Skip: Send 'skip' to continue without image</i>"
         )
     
-    # STEP 2: Await Image (URL or skip)
     elif state == SessionState.AWAIT_IMAGE:
-        text = message.text.strip().lower()
+        text = message.text.strip().lower() if message.text else ""
         
         if text == 'skip':
             name = data.get('name', 'Content')
@@ -1120,7 +1699,6 @@ def handle_admin_text(message):
         else:
             bot.reply_to(message, "⚠️ Send a photo, valid URL, or 'skip'")
     
-    # STEP 3: Await Buttons
     elif state == SessionState.AWAIT_BUTTONS:
         if message.text.strip().lower() == 'done':
             session.state = SessionState.AWAIT_CONFIRM
@@ -1188,7 +1766,6 @@ def handle_admin_text(message):
                 f"Send more buttons or 'done' to finish"
             )
     
-    # STEP 4: Await Confirmation
     elif state == SessionState.AWAIT_CONFIRM:
         cmd = message.text.strip().lower()
         
@@ -1239,142 +1816,64 @@ def handle_admin_text(message):
             )
         else:
             bot.reply_to(message, "⚠️ Send 'confirm' or 'cancel'")
-    
-    # Search Match
-    elif state == SessionState.SEARCH_MATCH:
-        query = validation_service.sanitize_text(message.text, 100)
-        results = match_repo.search(str(uid), query, Config.MAX_SEARCH_RESULTS)
-        
-        if results:
-            text = f"🔍 <b>Found {len(results)} result(s)</b>\n\n"
-            for i, match in enumerate(results, 1):
-                icon = "🖼️" if match.image_ref else "📄"
-                text += f"{i}. {icon} <b>{match.name}</b>\n   <code>{match._id}</code>\n\n"
-            bot.send_message(message.chat.id, text, reply_markup=get_admin_menu())
-        else:
-            bot.send_message(
-                message.chat.id,
-                f"❌ No results for: <b>{query}</b>",
-                reply_markup=get_admin_menu()
-            )
-        
-        session_repo.delete(uid)
-    
-    # Preview Match
-    elif state == SessionState.PREVIEW_MATCH:
-        try:
-            match = match_repo.find_by_id(message.text.strip(), str(uid))
-            
-            if match:
-                bot.send_message(message.chat.id, f"👁️ <b>Preview: {match.name}</b>")
-                
-                if match.image_ref:
-                    safe_send_photo(
-                        message.chat.id,
-                        match.image_ref,
-                        caption=match.caption,
-                        reply_markup=build_inline_buttons(match.buttons)
-                    )
-                else:
-                    bot.send_message(
-                        message.chat.id,
-                        match.caption,
-                        reply_markup=build_inline_buttons(match.buttons)
-                    )
-                
-                bot.send_message(
-                    message.chat.id,
-                    f"📊 Stats: {match.match_count} hits",
-                    reply_markup=get_admin_menu()
-                )
-            else:
-                bot.send_message(
-                    message.chat.id,
-                    "❌ Match not found or you don't have permission",
-                    reply_markup=get_admin_menu()
-                )
-        except Exception as e:
-            logger.error(f"Preview error: {e}")
-            bot.send_message(
-                message.chat.id,
-                "❌ Invalid Match ID",
-                reply_markup=get_admin_menu()
-            )
-        
-        session_repo.delete(uid)
-    
-    # Delete Match
-    elif state == SessionState.DELETE_MATCH:
-        try:
-            match = match_repo.find_by_id(message.text.strip(), str(uid))
-            
-            if match:
-                if match_repo.delete(str(match._id), str(uid)):
-                    bot.send_message(
-                        message.chat.id,
-                        f"✅ Deleted: <b>{match.name}</b>",
-                        reply_markup=get_admin_menu()
-                    )
-                    
-                    analytics_repo.log_event("match_deleted", {
-                        "admin_id": str(uid),
-                        "match_id": str(match._id),
-                        "name": match.name
-                    })
-                else:
-                    bot.send_message(
-                        message.chat.id,
-                        "❌ Failed to delete",
-                        reply_markup=get_admin_menu()
-                    )
-            else:
-                bot.send_message(
-                    message.chat.id,
-                    "❌ Match not found",
-                    reply_markup=get_admin_menu()
-                )
-        except Exception as e:
-            logger.error(f"Delete error: {e}")
-            bot.send_message(
-                message.chat.id,
-                "❌ Invalid Match ID",
-                reply_markup=get_admin_menu()
-            )
-        
-        session_repo.delete(uid)
 
+
+# ==================== PHOTO HANDLER ====================
 
 @bot.message_handler(func=lambda m: m.chat.type == "private", content_types=["photo"])
 @admin_only
 def handle_admin_photo(message):
-    """Handle photo uploads in match creation"""
+    """Handle photo uploads in match creation and editing"""
     uid = message.from_user.id
     session = session_repo.get(uid)
     
-    if not session or session.state != SessionState.AWAIT_IMAGE:
+    if not session:
         return
     
+    state = session.state
     data = session.data
     file_id = message.photo[-1].file_id
-    name = data.get('name', 'Content')
     
-    data['image_ref'] = file_id
-    data['caption'] = f"🎬 <b>{name}</b>\n\n✅ {name} available here 👇"
-    session.state = SessionState.AWAIT_BUTTONS
-    session_repo.save(session)
+    # EDIT IMAGE FLOW
+    if state == SessionState.EDIT_IMAGE:
+        match_id = data.get('editing_match_id')
+        updates = {'image_ref': file_id}
+        
+        if match_repo.update_full(match_id, str(uid), updates):
+            data['editing_match']['image_ref'] = file_id
+            session.state = SessionState.EDIT_SELECT_FIELD
+            session_repo.save(session)
+            
+            # Preview
+            safe_send_photo(
+                message.chat.id, 
+                file_id, 
+                caption=data['editing_match'].get('caption', '')
+            )
+            bot.send_message(message.chat.id, "✅ Photo updated!", reply_markup=get_edit_menu())
+        else:
+            bot.send_message(message.chat.id, "❌ Failed to update photo", reply_markup=get_edit_menu())
     
-    bot.send_message(message.chat.id, "⏳ Processing photo...")
-    
-    safe_send_photo(message.chat.id, file_id, caption=data['caption'])
-    
-    bot.send_message(
-        message.chat.id,
-        "✅ Photo saved!\n\n"
-        "🎯 <b>Step 3/4: Buttons</b>\n\n"
-        "🔘 Add buttons (optional):\n"
-        "<code>Button Text|https://your-link.com</code>\n\n"
-        "Send one per line, or 'done' to finish"
-    )
+    # CREATE FLOW
+    elif state == SessionState.AWAIT_IMAGE:
+        name = data.get('name', 'Content')
+        data['image_ref'] = file_id
+        data['caption'] = f"🎬 <b>{name}</b>\n\n✅ {name} available here 👇"
+        session.state = SessionState.AWAIT_BUTTONS
+        session_repo.save(session)
+        
+        bot.send_message(message.chat.id, "⏳ Processing photo...")
+        
+        safe_send_photo(message.chat.id, file_id, caption=data['caption'])
+        
+        bot.send_message(
+            message.chat.id,
+            "✅ Photo saved!\n\n"
+            "🎯 <b>Step 3/4: Buttons</b>\n\n"
+            "🔘 Add buttons (optional):\n"
+            "<code>Button Text|https://your-link.com</code>\n\n"
+            "Send one per line, or 'done' to finish"
+        )
 
 
 # ==================== GROUP HANDLERS ====================
@@ -1382,26 +1881,39 @@ def handle_admin_photo(message):
 @bot.message_handler(func=lambda m: m.chat.type in ("group", "supergroup"), 
                     content_types=["new_chat_members"])
 def handle_new_members(message):
-    """Welcome new members"""
+    """Welcome new members with auto-delete"""
     try:
         for member in message.new_chat_members:
             if member.id == bot.get_me().id:
                 # Bot added to group
-                bot.send_message(
+                welcome_msg = bot.send_message(
                     message.chat.id,
                     "👋 <b>Hello! Match Bot is now active!</b>\n\n"
                     "✅ Users can send queries and I'll respond automatically\n"
                     "💡 Admins manage matches via private chat with me"
+                )
+                # Auto-delete welcome message
+                auto_delete_service.delete_after(
+                    message.chat.id, 
+                    welcome_msg.message_id, 
+                    Config.AUTO_DELETE_WELCOME_MSG
                 )
             else:
                 # Welcome user
                 name_html = f"<a href='tg://user?id={member.id}'>{member.first_name}</a>"
                 welcome_text = WELCOME_MESSAGE.replace("{name}", name_html).replace("{req_format}", REQUEST_FORMAT)
                 
-                bot.send_message(
+                welcome_msg = bot.send_message(
                     message.chat.id,
                     welcome_text,
                     reply_markup=build_welcome_buttons()
+                )
+                
+                # Auto-delete welcome message
+                auto_delete_service.delete_after(
+                    message.chat.id, 
+                    welcome_msg.message_id, 
+                    Config.AUTO_DELETE_WELCOME_MSG
                 )
                 
                 logger.info(f"Welcomed user: {member.id}")
@@ -1415,11 +1927,23 @@ def handle_info_buttons(call):
     try:
         if call.data == "show_rules":
             bot.answer_callback_query(call.id, "Showing rules...")
-            bot.send_message(call.message.chat.id, RULES_MESSAGE)
+            rules_msg = bot.send_message(call.message.chat.id, RULES_MESSAGE)
+            # Auto-delete rules message
+            auto_delete_service.delete_after(
+                call.message.chat.id,
+                rules_msg.message_id,
+                Config.AUTO_DELETE_WELCOME_MSG
+            )
         
         elif call.data == "show_format":
             bot.answer_callback_query(call.id, "Showing request format...")
-            bot.send_message(call.message.chat.id, REQUEST_FORMAT)
+            format_msg = bot.send_message(call.message.chat.id, REQUEST_FORMAT)
+            # Auto-delete format message
+            auto_delete_service.delete_after(
+                call.message.chat.id,
+                format_msg.message_id,
+                Config.AUTO_DELETE_WELCOME_MSG
+            )
     except Exception as e:
         logger.error(f"Callback error: {e}")
 
@@ -1428,7 +1952,7 @@ def handle_info_buttons(call):
                     content_types=["text"])
 @rate_limited
 def handle_group_message(message):
-    """Handle user queries in groups"""
+    """Handle user queries in groups with auto-delete"""
     if not message.text or message.text.startswith('/') or len(message.text) < 2:
         return
     
@@ -1446,7 +1970,7 @@ def handle_group_message(message):
             
             # Send response
             if match.image_ref:
-                safe_send_photo(
+                response_msg = safe_send_photo(
                     message.chat.id,
                     match.image_ref,
                     caption=caption,
@@ -1454,10 +1978,18 @@ def handle_group_message(message):
                     reply_to=message.message_id
                 )
             else:
-                bot.reply_to(
+                response_msg = bot.reply_to(
                     message,
                     caption,
                     reply_markup=build_inline_buttons(match.buttons)
+                )
+            
+            # Auto-delete both query and response
+            if response_msg:
+                auto_delete_service.delete_query_and_response(
+                    message.message_id,
+                    response_msg.message_id,
+                    message.chat.id
                 )
             
             logger.info(f"Match found: {match.name} for query: {text[:50]}")
@@ -1607,7 +2139,9 @@ def setup_webhook():
 def main():
     """Main application entry point"""
     logger.info("=" * 60)
-    logger.info("🚀 Starting Production Telegram Bot")
+    logger.info("🚀 Starting Enhanced Production Telegram Bot")
+    logger.info("=" * 60)
+    logger.info("✨ Features: Full Edit Capability | Duplicate Prevention | Auto-Delete")
     logger.info("=" * 60)
     
     try:
