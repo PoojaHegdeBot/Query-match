@@ -263,7 +263,7 @@ class Match:
             data['_id'] = self._id
         # Remove None values
         return {k: v for k, v in data.items() if v is not None}
-        
+
 
 @dataclass
 class SessionData:
@@ -518,7 +518,7 @@ class MatchRepository:
             return None
 
 
-     def find_by_name(self, name: str, admin_id: str) -> Optional[Match]:
+    def find_by_name(self, name: str, admin_id: str) -> Optional[Match]:
         """Find match by name for specific admin"""
         try:
             doc = self.collection.find_one({
@@ -2185,6 +2185,11 @@ def main():
     finally:
         logger.info("👋 Bot stopped")
 
+
+# ==================== GUNICORN COMPATIBILITY ====================
+
+# Explicit declaration for Gunicorn
+application = app
 
 if __name__ == "__main__":
     main()
