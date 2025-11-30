@@ -249,16 +249,21 @@ class Match:
             self.buttons = []
         if self.created_at is None:
             self.created_at = int(time.time())
+        if self.updated_at is None:
+            self.updated_at = int(time.time())
         if self.pattern is None or self.pattern.strip() == "":
             self.pattern = self.name
+        if self.caption is None or self.caption.strip() == "":
+            self.caption = f"🎬 <b>{self.name}</b>\n\n✅ {self.name} available here 👇"
     
     def to_dict(self) -> dict:
         """Convert to dictionary for MongoDB"""
         data = asdict(self)
         if self._id:
             data['_id'] = self._id
-        return data
-
+        # Remove None values
+        return {k: v for k, v in data.items() if v is not None}
+        
 
 @dataclass
 class SessionData:
@@ -512,14 +517,20 @@ class MatchRepository:
             logger.error(f"❌ Find by ID error: {e}")
             return None
 
-    def find_by_name(self, name: str, admin_id: str) -> Optional[Match]:
+
+     def find_by_name(self, name: str, admin_id: str) -> Optional[Match]:
         """Find match by name for specific admin"""
         try:
             doc = self.collection.find_one({
                 "admin_id": admin_id,
                 "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}
             })
-            return Match(**doc) if doc else None
+            if doc:
+                # Ensure all required fields are present
+                if 'pattern' not in doc or not doc['pattern']:
+                    doc['pattern'] = doc.get('name', '')
+                return Match(**doc)
+            return None
         except Exception as e:
             logger.error(f"❌ Find by name error: {e}")
             return None
@@ -528,15 +539,16 @@ class MatchRepository:
         """Find match by either ID or Name"""
         # Try as ObjectId first
         try:
-            match = self.find_by_id(identifier, admin_id)
-            if match:
-                return match
+            if ObjectId.is_valid(identifier):
+                match = self.find_by_id(identifier, admin_id)
+                if match:
+                    return match
         except:
             pass
         
         # Try as name
         return self.find_by_name(identifier, admin_id)
-    
+
     def find_all_active(self) -> List[Match]:
         """Get all active matches (cached)"""
         cache_key = "matches:all_active"
