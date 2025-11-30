@@ -1,34 +1,29 @@
-# render.yaml — Render service definition for Telegram Query-Match Bot
+# render.yaml
 services:
   - type: web
     name: tg-query-match-bot
     env: python
     plan: free
-    region: oregon  # or: frankfurt, ohio, singapore
-    pythonVersion: "3.11"  # Important: Specify Python version
+    region: oregon
+    pythonVersion: "3.11"
     
     # Build & start commands
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 2 --timeout 120 --log-level info
+    startCommand: python app.py  # Use Python directly instead of Gunicorn
     
-    # Auto-deploy on git push
     autoDeploy: true
     
     # Health check
     healthCheckPath: /health
-    initialDelaySec: 15
+    initialDelaySec: 30
     
-    # Environment variables - Set secrets in Render dashboard
+    # Environment variables
     envVars:
-      - key: DB_NAME
-        value: tg_bot_db
-      - key: WEBHOOK_PATH
-        value: /webhook
       - key: PORT
-        value: 10000  # Render sets $PORT automatically, but this is backup
+        value: 10000
       - key: DEBUG
         value: "false"
       - key: USE_REDIS
-        value: "false"  # Disable Redis on Render free tier
+        value: "false"
