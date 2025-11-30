@@ -596,24 +596,27 @@ def safe_send_photo(chat_id: int, photo: str, caption: str = None,
 def cmd_start(message):
     user = message.from_user
     try:
-        if not admin_repo or not admin_repo.is_admin(user.id):
-            if admin_repo:
-                admin_repo.create_or_update(user.id, user.username, user.first_name)
-            text = (
-                f"👋 Welcome <b>{user.first_name}</b>!\n\n"
-                f"✅ You've been registered as an admin\n\n"
-                f"💡 Use the menu buttons below to manage matches:"
+        # Only allow admin IDs from environment
+        if user.id not in Config.ADMIN_IDS:
+            bot.send_message(
+                message.chat.id,
+                "❌ You are not authorized to use this bot."
             )
-        else:
-            text = (
-                f"👋 Welcome back <b>{user.first_name}</b>!\n\n"
-                f"🎯 Use menu buttons to manage your matches:"
-            )
-        bot.send_message(message.chat.id, text, reply_markup=get_admin_menu())
+            return
+
+        # Register admin (but only from ADMIN_IDS)
+        admin_repo.create_or_update(user.id, user.username, user.first_name)
+
+        bot.send_message(
+            message.chat.id,
+            f"👋 Welcome <b>{user.first_name}</b>!\n\n"
+            f"🎯 Use menu buttons to manage your matches:",
+            reply_markup=get_admin_menu()
+        )
         logger.info(f"Admin started bot: {user.id}")
+
     except Exception as e:
         logger.error(f"start error: {e}")
-
 
 @bot.message_handler(commands=["cancel", "help"])
 @private_chat_only
